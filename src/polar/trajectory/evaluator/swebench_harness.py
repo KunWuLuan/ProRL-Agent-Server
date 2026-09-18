@@ -88,6 +88,11 @@ class SwebenchHarnessEvaluator(BasePatchEvaluator):
         test_spec, get_eval_report = _load_harness(instance)
         eval_script_host = host_session_dir / "eval.sh"
         eval_script_host.write_text(test_spec.eval_script)
+        # Bind-mounted backends already see the file above; remote backends
+        # (E2B, ACK) need it pushed into the sandbox explicitly.
+        await runtime.publish_file(
+            eval_script_host, f"{runtime.runtime_session_dir}/eval.sh"
+        )
 
         # Place the log inside an instance_id-named directory so that
         # swegym/swebench get_logs_eval can parse the repo from the path.

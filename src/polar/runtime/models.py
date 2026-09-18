@@ -56,7 +56,7 @@ class ExecResult(BaseModel):
 class RuntimeSpec(BaseModel):
     """Container runtime configuration for one rollout session."""
 
-    backend: Literal["docker", "apptainer"] = "docker"
+    backend: Literal["docker", "apptainer", "e2b", "ack"] = "docker"
     image: str
     prepare: list[PrepareAction] = Field(default_factory=list)
     eval_prepare: list[PrepareAction] | None = None

@@ -15,6 +15,13 @@ _BUILTIN_BACKENDS: dict[str, type[BaseRuntime]] = {
     "apptainer": ApptainerRuntime,
 }
 
+# Backends whose SDK ships as an optional extra. They are resolved lazily so a
+# base install never imports (or fails on) dependencies it does not use.
+_OPTIONAL_BACKENDS: dict[str, str] = {
+    "e2b": "polar.runtime.e2b:E2BRuntime",
+    "ack": "polar.runtime.ack:ACKRuntime",
+}
+
 
 def create_runtime(
     spec: RuntimeSpec, session_id: str, session_dir: Path
@@ -22,19 +29,26 @@ def create_runtime(
     """Instantiate a runtime from a RuntimeSpec.
 
     Uses the built-in backend map for ``docker`` and ``apptainer``.
+    ``e2b`` and ``ack`` are resolved lazily from ``_OPTIONAL_BACKENDS``.
     Falls back to ``spec.import_path`` for plugin runtimes.
     """
     if spec.import_path:
         cls = _import_runtime_class(spec.import_path)
-        runtime = cls(spec, session_id, session_dir)
-        _validate_runtime_capabilities(runtime)
-        return runtime
-    cls = _BUILTIN_BACKENDS.get(spec.backend)
-    if cls is None:
-        raise ValueError(f"Unsupported runtime backend: {spec.backend}")
+    else:
+        cls = _resolve_backend(spec.backend)
     runtime = cls(spec, session_id, session_dir)
     _validate_runtime_capabilities(runtime)
     return runtime
+
+
+def _resolve_backend(backend: str) -> type[BaseRuntime]:
+    builtin = _BUILTIN_BACKENDS.get(backend)
+    if builtin is not None:
+        return builtin
+    optional = _OPTIONAL_BACKENDS.get(backend)
+    if optional is not None:
+        return _import_runtime_class(optional)
+    raise ValueError(f"Unsupported runtime backend: {backend}")
 
 
 def _import_runtime_class(import_path: str) -> type[BaseRuntime]:

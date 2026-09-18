@@ -257,6 +257,9 @@ class BasePatchEvaluator(BaseTrajectoryEvaluator):
         patch_path = host_session_dir / "patch.diff"
         patch_path.write_text(patch)
         runtime_patch_path = f"{runtime.runtime_session_dir}/patch.diff"
+        # Bind-mounted backends already see the file above; remote backends
+        # (E2B, ACK) need it pushed into the sandbox explicitly.
+        await runtime.publish_file(patch_path, runtime_patch_path)
         apply_cmd = (
             f"cd {shell_quote(self.repo_dir)} && "
             f"(git apply -v {shell_quote(runtime_patch_path)} && echo '{APPLY_PATCH_PASS}' || "
