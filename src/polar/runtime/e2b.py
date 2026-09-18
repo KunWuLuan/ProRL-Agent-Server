@@ -22,6 +22,19 @@ Config (``RuntimeSpec``)
 - ``kwargs.metadata`` *(dict)* — extra metadata attached to the sandbox.
 
 Requires the ``e2b`` extra (``uv pip install 'polar[e2b]'``) and ``E2B_API_KEY``.
+
+Self-hosted control planes
+--------------------------
+Every request here goes through the official ``e2b`` SDK, so the endpoints come
+from the SDK's own environment: ``E2B_API_KEY``, ``E2B_DOMAIN``, ``E2B_API_URL``
+(control-plane override) and ``E2B_SANDBOX_URL`` (data-plane override). A plane
+that implements neither template builds nor alias lookup — the common case for a
+self-hosted manager — must be driven with ``kwargs.template`` naming a template
+that already exists there, otherwise ``start()`` tries to build one and fails.
+The sandbox pod also needs ``CAP_SYS_RESOURCE``: envd prefixes each command with
+an ``oom_score_adj`` write, and without the capability that write fails, so the
+command never runs (exit 1, ``echo: I/O error``) even though the filesystem API
+still works. See ``RUNBOOK.md`` → *E2B on a self-hosted control plane*.
 """
 
 from __future__ import annotations

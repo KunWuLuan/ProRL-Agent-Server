@@ -77,7 +77,7 @@ rather than a permissions problem.
 | --- | --- | --- | --- | --- |
 | ACK Pod | — | image pull + schedule | yes | one-off runs, no OpenKruise in the cluster, per-instance images |
 | ACK SandboxClaim | `use_sandbox_claim: true` | seconds (warm pool) | no — one pool per image | many concurrent rollouts over a **small** set of images |
-| E2B | — | template build once, then seconds | no — one build per image | no cluster at all |
+| E2B | — | template build once, then seconds | no — one build per image | no cluster of your own, or a self-hosted E2B control plane |
 
 SandboxClaim mode keeps a warm `SandboxSet` pool, sized for **two sandboxes per
 session** when `evaluator.refresh_runtime` is true (one for the agent, one fresh
@@ -136,13 +136,13 @@ next task gets the new one. Where it lands depends on the mode:
 | --- | --- |
 | ACK Pod | Direct. Each session's pod is built from `kwargs.sandbox_image or image` (`src/polar/runtime/ack/runtime.py:116`). |
 | ACK SandboxClaim | The pool name is derived from the image (`src/polar/runtime/ack/runtime.py:79`), so a new image means a **new** `SandboxSet` built from it. |
-| E2B | The template alias is `polar-<slug>-<sha256(image)[:12]>` (`src/polar/runtime/e2b.py:115`), so a new image means a new alias, which `start()` **builds** from that image (`src/polar/runtime/e2b.py:174`). Unlike ACK, E2B does build. |
+| E2B | The template alias is `polar-<slug>-<sha256(image)[:12]>` (`src/polar/runtime/e2b.py:128`), so a new image means a new alias, which `start()` **builds** from that image (`src/polar/runtime/e2b.py:187`). Unlike ACK, E2B does build. |
 
 **Pinning a pool or template name defeats all three.** `_ensure_sandboxset()`
 returns as soon as a `SandboxSet` with that name exists and does **not** compare
 images (`src/polar/runtime/ack/runtime.py:770`); likewise an explicit `kwargs.template`
 skips the build (`build_template` defaults to false,
-`src/polar/runtime/e2b.py:114`) and `image` is then recorded only as sandbox
+`src/polar/runtime/e2b.py:127`) and `image` is then recorded only as sandbox
 metadata. In both cases the session quietly runs the *old* image, with nothing in
 the logs to say so. Either let the name be derived from the image, or change the
 pinned name at the same time as the image.
@@ -193,6 +193,130 @@ These run through `runtime.exec()`, not on the host. Four rules that bite:
 
 `eval_prepare` should stay minimal — the grading runtime only needs git config
 and a writable `$HOME`; the evaluator uploads `patch.diff` and `eval.sh` itself.
+
+### E2B on a self-hosted control plane
+
+`E2BRuntime` is a client of the official `e2b` Python SDK — Polar issues no HTTP
+requests of its own. Everything the backend does is an SDK call:
+`AsyncSandbox.create` (`src/polar/runtime/e2b.py:209`), `sandbox.commands.run`
+(`src/polar/runtime/e2b.py:296`), `sandbox.files.write` / `write_files` / `read` /
+`list` (`src/polar/runtime/e2b.py:356`), `sandbox.kill`
+(`src/polar/runtime/e2b.py:251`), plus `AsyncTemplate.alias_exists` and
+`AsyncTemplate.build` for template provisioning (`src/polar/runtime/e2b.py:178`,
+`src/polar/runtime/e2b.py:194`). Any control plane that implements the E2B API
+therefore works, including a self-hosted one — this path was verified end to end
+against an ACK/ACS `sandbox-manager` exposing the E2B endpoints (`GET /templates`,
+`GET /v2/sandboxes`, `POST /sandboxes`, `DELETE /sandboxes/{id}`).
+
+Endpoint discovery belongs to the SDK, so a self-hosted plane is selected with the
+SDK's own environment variables:
+
+| Variable | Effect | Default |
+| --- | --- | --- |
+| `E2B_API_KEY` | Required — `E2BRuntime.__init__` raises without it (`src/polar/runtime/e2b.py:107`) | — |
+| `E2B_DOMAIN` | Domain the sandbox host names are derived from | `e2b.app` |
+| `E2B_API_URL` | Control-plane override: point it at the self-hosted manager | `https://api.<domain>` |
+| `E2B_SANDBOX_URL` | Data-plane override: pins **every** sandbox to one envd URL | `https://49983-<sandbox_id>.<domain>` |
+
+What a self-hosted plane usually does *not* implement, and what to do about it:
+
+| Gap | Consequence | Workaround |
+| --- | --- | --- |
+| Template build (`POST /v2/templates`, `/v3/templates`) | `AsyncTemplate.build` 404s, so `_create_template()` can never succeed | Pass `kwargs.template`; `build_template` already defaults to `False` for an explicit template (`src/polar/runtime/e2b.py:127`) |
+| Alias lookup (`GET /templates/aliases/{alias}`) | `alias_exists` is False for a template that **does** exist, so a derived alias makes `start()` attempt a build on every session | Same — pin `kwargs.template` |
+| Wildcard data-plane routing (`*.<domain>` → envd `49983`) | The SDK cannot address a sandbox by name | Expose the plane's sandbox gateway; for a single-sandbox smoke test point `E2B_SANDBOX_URL` (or `E2B_DEBUG=true`, which implies `http://localhost:49983`) at a port-forward of that pod's envd port. One URL = one sandbox, so this does not scale past a smoke test |
+
+Templates are created out-of-band: the manager lists its own pool objects, so
+create the pool (an `agents.kruise.io` `SandboxSet` on ACK/ACS) and use its name as
+`kwargs.template`. `stop()` → `sandbox.kill()` deletes the sandbox pod; the pool
+object and its warm replicas survive, so nothing accumulates per session.
+
+Two sandbox-pod requirements that fail in confusing ways:
+
+- **Keep `kwargs.user` at `root`** (the default, `src/polar/runtime/e2b.py:113`).
+  It is passed to every `commands.run`; a non-root identity also drops the
+  container's capabilities, which matters for the next point.
+- **Give the sandbox container `CAP_SYS_RESOURCE`.** envd prefixes every command
+  with `echo <n> > /proc/$$/oom_score_adj && ... exec <cmd>`. Sandbox pods run with
+  a high `oom_score_adj` (commonly `968`) and lowering it needs that capability.
+  Without it the prelude's `echo` fails, so **the user command never runs**: every
+  `commands.run` returns exit code 1 with stderr `--: 1: echo: echo: I/O error`
+  while the files API keeps working, which reads like an SDK or transport bug.
+
+  ```yaml
+  securityContext:
+    capabilities:
+      add: ["SYS_RESOURCE"]
+  ```
+
+Smoke sequence — everything through the runtime API, so the SDK is doing all of
+it. With a routable sandbox gateway this is plain `start()`; without one the data
+plane can only be tunnelled **after** the sandbox exists (`runtime_id` is
+`<namespace>--<pod>`), so the smoke test splits `start()` around the tunnel:
+
+```bash
+export E2B_API_KEY=<key>
+# Self-hosted plane only — where the SDK sends control- and data-plane traffic.
+# Both are read when the sandbox object is built, so export them before running:
+export E2B_API_URL=http://127.0.0.1:<manager-port>
+export E2B_DOMAIN=<sandbox-domain>
+export E2B_SANDBOX_URL=http://127.0.0.1:49983
+```
+
+```python
+import asyncio, socket, subprocess, time
+from pathlib import Path
+from polar.runtime.factory import create_runtime
+from polar.runtime.models import RuntimeSpec
+
+def wait_port(port: int, timeout: float = 90.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), 2):
+                return True
+        except OSError:
+            time.sleep(1)
+    return False
+
+async def main():
+    work = Path("/tmp/sanity"); work.mkdir(parents=True, exist_ok=True)
+    probe = work / "probe.txt"; probe.write_text("publish-ok\n")
+
+    spec = RuntimeSpec(backend="e2b", image="<tiny-image>",
+                       kwargs={"template": "<existing-template>"})
+    rt = create_runtime(spec, "sanity", work)
+
+    await rt._create_sandbox()                     # SDK: AsyncSandbox.create
+    ns, _, pod = rt.runtime_id.partition("--")
+    tunnel = subprocess.Popen(["kubectl", "-n", ns, "port-forward", f"pod/{pod}",
+                               "49983:49983"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if not wait_port(49983):
+            raise RuntimeError(f"no data-plane route to {rt.runtime_id}")
+        await rt._ensure_session_dirs()            # the rest of start()
+        print("exec     :", (await rt.exec("echo hi")).stdout.strip())
+        await rt.publish_file(probe, f"{rt.runtime_session_dir}/probe.txt")
+        print("publish  :", (await rt.exec(f"cat {rt.runtime_session_dir}/probe.txt")).stdout.strip())
+        print("timeout  :", (await rt.exec("sleep 8", timeout_sec=1)).return_code)  # -1
+        await rt.upload_file(str(probe), f"{rt.runtime_session_dir}/up.bin")
+        await rt.download_file(f"{rt.runtime_session_dir}/up.bin", str(work / "down.bin"))
+        print("roundtrip:", (work / "down.bin").read_bytes() == probe.read_bytes())
+        print("host path:", rt.resolve_host_path("/polar/session"))                 # None
+    finally:
+        await rt.stop()
+        tunnel.terminate()
+
+asyncio.run(main())
+```
+
+`_create_sandbox()` and `_ensure_session_dirs()` are internals, used here only
+because the tunnel has to be aimed mid-`start()`. Claiming a warm sandbox makes
+the pool refill a replacement pod, so a `replicas: 1` pool stays at one free
+sandbox while sessions come and go; `stop()` deletes the claimed pod and never
+the pool. With a binary payload instead of text, `roundtrip` is the check that
+catches a transfer decoding frames as UTF-8.
 
 ## Step 4 — Deploy the control plane where sandboxes can reach it
 
@@ -557,6 +681,9 @@ await runtime.stop()
 A standalone script that exercises `start` / `exec` / timeout / `resolve_host_path`
 / `stop` against a live cluster is in
 [ACK → Sanity check](ack/README.md#sanity-check); swap the spec for E2B.
+For E2B on a self-hosted control plane, the equivalent sequence — plus the
+endpoint variables and the two pod requirements — is in
+[E2B on a self-hosted control plane](#e2b-on-a-self-hosted-control-plane).
 
 ## Troubleshooting
 
@@ -574,6 +701,9 @@ A standalone script that exercises `start` / `exec` / timeout / `resolve_host_pa
 | Harness CLI not found at RUN after moving off Docker/Apptainer | `kwargs.volumes` is ignored by `ack`/`e2b`; the mounted tooling directory does not exist | Bake the CLIs into the image or install them in `prepare`; on ACK use `kwargs.pod_overrides` for a real volume |
 | Session runs an **older** image than the spec says | `sandboxset_name` / `template` pinned while `image` changed; the existing pool or template is reused without an image check | Derive the name from the image, or rename the pool/template together with the image |
 | RL steps are short / acceptance rate low, but no errors | Sessions failed to provision, so the bridge dropped those groups | Check gateway logs and pool stock; a missing image or exhausted quota looks like this |
+| E2B: every `commands.run` exits 1 with `--: 1: echo: echo: I/O error`, files API fine | envd's `oom_score_adj` prelude failed — the sandbox pod lacks `CAP_SYS_RESOURCE`, or the command runs as a non-root user | Add `SYS_RESOURCE` to the sandbox container and keep `kwargs.user: root` |
+| E2B: `start()` 404s on `POST /templates` | The control plane does not implement template builds | Pass `kwargs.template` naming an existing template |
+| E2B: every session rebuilds a template that already exists | `alias_exists` 404s on a self-hosted plane, so `_template_exists()` is always False | Pass `kwargs.template` explicitly — `build_template` then defaults to False |
 
 ACK-only symptoms — RBAC 403s, claims stuck in `Claiming`, claim→sandbox
 resolution, leftover pools, warm-pool sizing, image-pull failures and the

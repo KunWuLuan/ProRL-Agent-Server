@@ -27,7 +27,9 @@ tear it down.
   the bind-mount copy helpers.
 - `docker.py`: `DockerRuntime` — the default backend.
 - `apptainer.py`: `ApptainerRuntime` — daemonless, for clusters.
-- `e2b.py`: `E2BRuntime` — E2B cloud sandboxes (optional `e2b` extra).
+- `e2b.py`: `E2BRuntime` — E2B cloud sandboxes (optional `e2b` extra). A pure
+  client of the official `e2b` SDK, so it also drives a self-hosted E2B control
+  plane.
 - `ack/`: `ACKRuntime` — Kubernetes pods and OpenKruise sandbox pools (optional
   `ack` extra). A package rather than a single module: `_sdk.py` holds the extra
   guard and cluster constants, `_util.py` the manifest helpers, `client.py` the
@@ -100,6 +102,17 @@ runtime:
   kwargs:
     template: "polar-swebench"   # optional: reuse a pre-built alias
 ```
+
+Every one of those calls is the official `e2b` SDK — `AsyncSandbox.create`,
+`sandbox.commands.run`, `sandbox.files.*`, `sandbox.kill`. Polar adds no HTTP of
+its own, so any control plane implementing the E2B API works, including a
+self-hosted one: point the SDK's `E2B_API_URL` / `E2B_DOMAIN` at it, plus
+`E2B_SANDBOX_URL` when the sandbox data plane is not routable by name. Such a
+plane typically implements neither template builds nor alias lookup, so pin
+`kwargs.template` to a template that already exists there. The endpoint
+variables, the sandbox pod requirements (`CAP_SYS_RESOURCE`, `kwargs.user`) and
+the smoke sequence are in the runbook's
+[E2B on a self-hosted control plane](RUNBOOK.md#e2b-on-a-self-hosted-control-plane).
 
 ACK creates one `sleep infinity` Pod per session — or, with
 `kwargs.use_sandbox_claim`, claims a pre-warmed sandbox from an OpenKruise
