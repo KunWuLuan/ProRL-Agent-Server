@@ -47,6 +47,19 @@ Slime calls one entry point, `generate_rollout_polar_async`, wired in via
   advantages.
 - Run the evaluation path over `eval_datasets` and emit W&B metrics.
 
+## Remote runtime backends
+
+The bridge is backend-agnostic: `polar_task_template.runtime` is rendered per
+sample and passed straight through, so `backend: "ack"` or `"e2b"` works exactly
+like the `docker` / `apptainer` defaults. Three things change in practice —
+`kwargs.volumes` is ignored remotely, `inference` is rewritten to point at Slime's
+SGLang router, and peak sandbox count is `max_session_concurrency` (double the
+churn with `refresh_runtime`). Read
+[RL training against a remote runtime](../polar/runtime/RUNBOOK.md#rl-training-against-a-remote-runtime-slime)
+before pointing a training job at a cluster; it covers template placeholders,
+per-sample images, pool sizing and why provisioning failures surface as dropped
+groups rather than errors.
+
 ## Slime installation
 
 Install Slime from the THUDM git checkout (not the unrelated PyPI `slime`

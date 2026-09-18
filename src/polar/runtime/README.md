@@ -64,8 +64,10 @@ and evaluators behave the same on either.
 
 ## Remote backends (E2B, ACK)
 
-For a full walkthrough — control-plane placement, RBAC, task payload, verification
-checklist and troubleshooting — see [RUNBOOK.md](RUNBOOK.md).
+For a full walkthrough — control-plane placement, RBAC, task payload, image
+selection for multi-image datasets, verification checklist, troubleshooting, and
+driving these backends from a Slime RL training loop — see
+[RUNBOOK.md](RUNBOOK.md).
 
 `E2BRuntime` and `ACKRuntime` run the session off-host, so `start()` creates the
 well-known `/polar/session` directories inside the sandbox and
@@ -128,3 +130,15 @@ variables, which ACK merges into every `exec`.
 
 Neither remote backend supports GPUs, and ACK cannot disable internet access, so
 the factory rejects specs that ask for those.
+
+`kwargs.volumes` is **not** rejected — it is read only by `docker` and
+`apptainer`, and remote backends ignore it silently, since there is no host to
+mount from. A config ported from a bind-mounted backend therefore loses its
+mounted tooling without any error; bake it into the image, install it in
+`prepare`, or on ACK express a real volume through `kwargs.pod_overrides`.
+
+`spec.image` is resolved per session, and `TaskRequest.runtime` is per task, so
+one deployment can run a dataset whose instances need different images. The
+derivation rules, and what each mode costs when the image count is large, are in
+the runbook's
+[One dataset, many images](RUNBOOK.md#one-dataset-many-images).
