@@ -28,8 +28,11 @@ tear it down.
 - `docker.py`: `DockerRuntime` — the default backend.
 - `apptainer.py`: `ApptainerRuntime` — daemonless, for clusters.
 - `e2b.py`: `E2BRuntime` — E2B cloud sandboxes (optional `e2b` extra).
-- `ack.py`: `ACKRuntime` — Kubernetes pods and OpenKruise sandbox pools
-  (optional `ack` extra).
+- `ack/`: `ACKRuntime` — Kubernetes pods and OpenKruise sandbox pools (optional
+  `ack` extra). A package rather than a single module: `_sdk.py` holds the extra
+  guard and cluster constants, `_util.py` the manifest helpers, `client.py` the
+  shared client manager, `runtime.py` the backend itself. See
+  [ack/README.md](ack/README.md).
 - `factory.py`: backend lookup + capability validation; also loads a custom
   backend via `RuntimeSpec.import_path`. `e2b`/`ack` are imported lazily, so a
   base install never needs their SDKs.
@@ -100,33 +103,18 @@ runtime:
 
 ACK creates one `sleep infinity` Pod per session — or, with
 `kwargs.use_sandbox_claim`, claims a pre-warmed sandbox from an OpenKruise
-`SandboxSet` pool, which starts sessions much faster at high rollout
-concurrency. The pool is shared across sessions and deliberately left running on
-`stop()`. `cpus` / `memory_mb` / `storage_mb` become Pod resource requests, and
-`kwargs.pod_overrides` is deep-merged into the manifest. Unlike Harbor's
-`ACKEnvironment`, this backend never builds images: `spec.image` must already be
-pushed somewhere the cluster can pull it.
+`SandboxSet` pool, which starts sessions much faster at high rollout concurrency.
+The pool is shared across sessions and deliberately left running on `stop()`.
+Unlike Harbor's `ACKEnvironment`, this backend never builds images: `spec.image`
+must already be pushed somewhere the cluster can pull it.
 
 File transfers stream a tar over the Kubernetes exec websocket in binary mode
 (`binary=True`), so binary artifacts survive the round trip; the default text
 mode decodes each frame as UTF-8 and silently corrupts them.
 
-```yaml
-runtime:
-  backend: "ack"
-  image: "registry.example.com/polar/swebench:latest"
-  cpus: 4
-  memory_mb: 8192
-  kwargs:
-    namespace: "polar"
-    image_pull_secret: "registry-credentials"
-    use_sandbox_claim: true
-    sandboxset_replicas: 32
-```
-
-`kwargs.sandbox_env_vars` rides on the SandboxClaim, but the controller only
-injects it into pools with envd enabled — use `spec.env` for per-session
-variables, which ACK merges into every `exec`.
+RBAC, the full `kwargs` table, `pod_overrides` and volume handling, the
+OpenKruise claim lifecycle, pool sizing, teardown semantics and ACK-only
+troubleshooting are in [ack/README.md](ack/README.md).
 
 Neither remote backend supports GPUs, and ACK cannot disable internet access, so
 the factory rejects specs that ask for those.

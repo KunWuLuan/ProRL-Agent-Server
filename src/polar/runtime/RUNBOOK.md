@@ -12,6 +12,9 @@ Everything below is backend-agnostic unless a step says otherwise. Cluster
 specifics are written as placeholders: `<namespace>`, `<kube-context>`,
 `<registry>`, `<control-host>`.
 
+Backend-specific references: [ACK](ack/README.md) — RBAC, kwargs, OpenKruise pool
+lifecycle, teardown, and ACK-only troubleshooting.
+
 Related reading: [runtime backends](README.md),
 [gateway](../gateway/README.md), [evaluators](../trajectory/evaluator/README.md),
 [the SWE-bench example](../../../examples/swebench_verified/README.md).
@@ -51,37 +54,22 @@ Two consequences drive the whole runbook:
 | --- | --- |
 | `polar[ack]` or `polar[e2b]` | `uv sync --extra ack --extra swebench` |
 | `swebench` **>=4,<5** | 5.x removed `swebench.harness.test_spec`, which `swebench_harness` imports. `uv.lock` pins a working version; a bare `pip install polar[swebench]` may not. |
-| Cluster access | A kubeconfig context with RBAC below, or in-cluster ServiceAccount. |
+| Cluster access | ACK only: a kubeconfig context with the [RBAC](ack/README.md#rbac) below, or an in-cluster ServiceAccount. |
 | A pullable image | Remote backends never build. `spec.image` must already exist in a registry the cluster can pull. |
-| Inference endpoint | SGLang or vLLM (OpenAI-compatible). See [Appendix A](#appendix-a-smoke-testing-without-a-model-server) for a stub. |
+| Inference endpoint | SGLang or vLLM (OpenAI-compatible). See [the appendix](#appendix-smoke-testing-without-a-model-server) for a stub. |
 
 ## Step 1 — Cluster RBAC
 
-The control plane creates and tears down pods and OpenKruise sandboxes. Grant the
-minimum below in `<namespace>`:
+*ACK only — E2B needs an `E2B_API_KEY` instead and has no cluster step.*
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata: {name: polar-runtime, namespace: <namespace>}
-rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["pods/exec", "pods/attach"]
-    verbs: ["create", "get"]
-  - apiGroups: [""]
-    resources: ["pods/log", "events"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["agents.kruise.io"]          # SandboxClaim mode only
-    resources: ["sandboxsets", "sandboxclaims", "sandboxes"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-```
+The control plane creates and tears down pods and OpenKruise sandboxes, so the
+ServiceAccount it runs as needs `pods`, `pods/exec`, `pods/log`, `events`, and —
+in SandboxClaim mode — the `agents.kruise.io` group. The ready-to-apply Role is in
+[ACK → RBAC](ack/README.md#rbac).
 
-Bind it to the ServiceAccount the control plane runs as. `kubectl auth can-i`
-each verb before debugging anything else — a 403 on `sandboxclaims` surfaces as a
-`RuntimeError` from `ACKRuntime.start()`.
+`kubectl auth can-i` each verb before debugging anything else: a 403 surfaces as a
+`RuntimeError` from `ACKRuntime.start()`, which looks like a provisioning failure
+rather than a permissions problem.
 
 ## Step 2 — Choose the allocation mode
 
@@ -91,10 +79,13 @@ each verb before debugging anything else — a 403 on `sandboxclaims` surfaces a
 | ACK SandboxClaim | `use_sandbox_claim: true` | seconds (warm pool) | no — one pool per image | many concurrent rollouts over a **small** set of images |
 | E2B | — | template build once, then seconds | no — one build per image | no cluster at all |
 
-SandboxClaim mode keeps a warm `SandboxSet` pool. Size it for **two sandboxes per
+SandboxClaim mode keeps a warm `SandboxSet` pool, sized for **two sandboxes per
 session** when `evaluator.refresh_runtime` is true (one for the agent, one fresh
 one for grading). Claims set `createOnNoStock: true`, so an undersized pool
-degrades to on-demand creation rather than failing.
+degrades to on-demand creation rather than failing — you lose warm starts at peak
+load without seeing an error. Pool lifecycle, claim→sandbox resolution and
+teardown semantics are in
+[ACK → OpenKruise SandboxSet / SandboxClaim](ack/README.md#openkruise-sandboxset--sandboxclaim).
 
 ## Step 3 — Runtime spec
 
@@ -124,17 +115,13 @@ runtime:
   eval_prepare:                        # recipe for the fresh grading runtime
     - type: exec
       command: "..."
-  kwargs:
+  kwargs:                              # backend-specific; see below
     namespace: "<namespace>"           # required for ack
-    context: "<kube-context>"          # optional; omit for in-cluster config
-    image_pull_secret: "<pull-secret>" # optional
-    use_sandbox_claim: true
-    sandbox_image: "<pool-image>"      # optional; pool image, defaults to `image`
-    sandboxset_name: "<pool-name>"     # optional; derived from the image by default
-    sandboxset_replicas: 4
-    claim_timeout: 900
-    pod_ready_timeout: 900
 ```
+
+Everything under `kwargs` belongs to one backend. The full ACK set — cluster
+selection, scheduling, `pod_overrides`, resource limits, and the pool knobs — is
+tabulated in [ACK → Configuration](ack/README.md#configuration).
 
 E2B equivalents: `kwargs.template` reuses a pre-built sandbox template,
 `allow_internet: false` creates the sandbox offline, and `kwargs.allow_out` sets
@@ -147,13 +134,13 @@ next task gets the new one. Where it lands depends on the mode:
 
 | Mode | Effect of changing `image` |
 | --- | --- |
-| ACK Pod | Direct. Each session's pod is built from `kwargs.sandbox_image or image` (`src/polar/runtime/ack.py:369`). |
-| ACK SandboxClaim | The pool name is derived from the image (`src/polar/runtime/ack.py:332`), so a new image means a **new** `SandboxSet` built from it. |
+| ACK Pod | Direct. Each session's pod is built from `kwargs.sandbox_image or image` (`src/polar/runtime/ack/runtime.py:116`). |
+| ACK SandboxClaim | The pool name is derived from the image (`src/polar/runtime/ack/runtime.py:79`), so a new image means a **new** `SandboxSet` built from it. |
 | E2B | The template alias is `polar-<slug>-<sha256(image)[:12]>` (`src/polar/runtime/e2b.py:115`), so a new image means a new alias, which `start()` **builds** from that image (`src/polar/runtime/e2b.py:174`). Unlike ACK, E2B does build. |
 
 **Pinning a pool or template name defeats all three.** `_ensure_sandboxset()`
 returns as soon as a `SandboxSet` with that name exists and does **not** compare
-images (`src/polar/runtime/ack.py:1023`); likewise an explicit `kwargs.template`
+images (`src/polar/runtime/ack/runtime.py:770`); likewise an explicit `kwargs.template`
 skips the build (`build_template` defaults to false,
 `src/polar/runtime/e2b.py:114`) and `image` is then recorded only as sandbox
 metadata. In both cases the session quietly runs the *old* image, with nothing in
@@ -176,7 +163,7 @@ What each mode costs when the dataset has **M** distinct images:
 | Mode | Cost | Verdict |
 | --- | --- | --- |
 | ACK Pod | One pod per session, deleted by `stop()`. M does not affect resident resources. | Use this. Requires all M images already pushed to a registry the cluster can pull. |
-| ACK SandboxClaim | M `SandboxSet`s × `sandboxset_replicas` (default 5, `src/polar/runtime/ack.py:325`) resident sandboxes — and `stop()` deliberately **keeps** pools (`src/polar/runtime/ack.py:556`), so they accumulate for the life of the run. | Only when M is small. |
+| ACK SandboxClaim | M `SandboxSet`s × `sandboxset_replicas` (default 5, `src/polar/runtime/ack/runtime.py:72`) resident sandboxes — and `stop()` deliberately **keeps** pools (`src/polar/runtime/ack/runtime.py:303`), so they accumulate for the life of the run. | Only when M is small. |
 | E2B | M template **builds**, one per distinct image. | Only when M is small. |
 
 For a large-M dataset either accept Pod mode, or converge on one image and
@@ -334,10 +321,12 @@ Session stages are `INITIALIZING → READY → RUNNING → POST_RUN → COMPLETE
 Watch the pieces that actually tell you where it is:
 
 ```bash
-kubectl -n <namespace> get sandboxclaim,sandbox -w     # claim -> Completed, sandbox bound
-kubectl -n <namespace> exec <claimed-sandbox> -- sh -c 'ls /polar/session/workspace | wc -l'
 tail -f gateway.log    # proxied LLM calls appear as "POST /v1/chat/completions"
 ```
+
+The sandbox side is backend-specific: for ACK, watch the claim and the pool with
+`kubectl` and exec into the claimed sandbox — commands in
+[ACK → Observability](ack/README.md#observability).
 
 ## Step 8 — Verification checklist
 
@@ -357,19 +346,19 @@ A run is genuinely green when **all** of these hold:
 
 ## Step 9 — Teardown
 
-`stop()` deletes the claimed Sandbox **and** its SandboxClaim, and deliberately
-keeps the warm pool. Confirm, don't assume:
+`stop()` is idempotent and removes everything the session created — but shared,
+pre-warmed infrastructure outlives it by design. Confirm nothing is left rather
+than assuming it:
 
-```bash
-kubectl -n <namespace> get sandboxclaim        # expect: none of yours
-kubectl -n <namespace> get sandbox -L agents.kruise.io/sandbox-claimed
-kubectl -n <namespace> delete sandboxset <pool-name>   # when done for good
-```
+- **ACK Pod mode** — the Pod is deleted. **SandboxClaim mode** — the claimed
+  Sandbox *and* its SandboxClaim are deleted, and the `SandboxSet` pool is
+  **kept**. A run over a per-instance-image dataset therefore leaves one pool per
+  image behind; list and delete them when the job finishes.
+- **E2B** — the sandbox is killed; built templates persist and are reused.
 
-A sandbox stuck at `sandbox-claimed=true` whose claim is gone is an orphan: the
-controller does **not** release a claimed sandbox when its claim is deleted, and
-the pool will not reclaim it. Delete it by hand and treat it as a bug report —
-it means the runtime resolved the wrong sandbox (see Troubleshooting).
+The ACK verification commands, and the orphaned-sandbox failure mode (a claimed
+Sandbox whose claim is gone is never reclaimed by the controller), are in
+[ACK → Teardown](ack/README.md#teardown).
 
 ## RL training against a remote runtime (Slime)
 
@@ -380,7 +369,7 @@ connects [Slime](https://github.com/THUDM/slime)'s RL loop to a running Polar
 rollout server over HTTP. It lives outside the `polar` package because Polar
 depends on none of Slime, Ray, Megatron or torch.
 
-The runtime backends behave identically under RL — nothing in `ack.py` or `e2b.py`
+The runtime backends behave identically under RL — nothing in the `ack` package or `e2b.py`
 knows whether the caller is a script or a training loop. What changes is *who*
 renders the task, *how many* sandboxes you need at once, and *how quietly* things
 fail.
@@ -503,7 +492,7 @@ idle.
 
 | Apptainer-ism | Remote behaviour |
 | --- | --- |
-| `kwargs.volumes: ["<host-dir>:/opt/node:ro"]` | **Silently ignored.** Only `docker` (`src/polar/runtime/docker.py:62`) and `apptainer` (`src/polar/runtime/apptainer.py:64`) read `volumes`; `factory.py` has no capability check for it. The shipped config mounts Node plus the agent CLIs and puts `/opt/node/bin` on `PATH` — on a remote backend that path does not exist, so the harness CLI is not found at RUN. Bake the CLIs into the image, or install them in `prepare`. On ACK a real mount is still possible through `kwargs.pod_overrides`, which is deep-merged into the pod spec (`src/polar/runtime/ack.py:495`), using a PVC or hostPath volume plus matching `volumeMounts`. |
+| `kwargs.volumes: ["<host-dir>:/opt/node:ro"]` | **Silently ignored.** Only `docker` (`src/polar/runtime/docker.py:62`) and `apptainer` (`src/polar/runtime/apptainer.py:64`) read `volumes`; `factory.py` has no capability check for it. The shipped config mounts Node plus the agent CLIs and puts `/opt/node/bin` on `PATH` — on a remote backend that path does not exist, so the harness CLI is not found at RUN. Bake the CLIs into the image, or install them in `prepare`. On ACK a real mount is still possible through `kwargs.pod_overrides`, which is deep-merged into the pod spec (`src/polar/runtime/ack/runtime.py:242`), using a PVC or hostPath volume plus matching `volumeMounts`. |
 | `image: "<dir>/{…}.sif"` | Local SIF paths do not exist remotely; `image` must be a pullable registry ref. |
 | `network: "host"` | Meaningless remotely. Use `allow_internet` / `kwargs.allow_out` on e2b; ACK pods get cluster networking. |
 | `prepare` assumes mounted tooling | Rewrite against Step 3's remote rules — `$HOME`, `PATH`, idempotency, package mirror. |
@@ -557,7 +546,7 @@ from pathlib import Path
 from polar.runtime.factory import create_runtime
 from polar.runtime.models import RuntimeSpec
 
-spec = RuntimeSpec(backend="ack", image="<image>", kwargs={"namespace": "<namespace>"})
+spec = RuntimeSpec(backend="<backend>", image="<image>", kwargs={...})
 runtime = create_runtime(spec, "session-1", Path("/tmp/session-1"))
 await runtime.start()
 result = await runtime.exec("python -V", timeout_sec=30)
@@ -565,28 +554,33 @@ await runtime.publish_file(Path("eval.sh"), f"{runtime.runtime_session_dir}/eval
 await runtime.stop()
 ```
 
+A standalone script that exercises `start` / `exec` / timeout / `resolve_host_path`
+/ `stop` against a live cluster is in
+[ACK → Sanity check](ack/README.md#sanity-check); swap the spec for E2B.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Session runs, but a *different* sandbox shows the work; a claimed sandbox is orphaned after teardown | Claim→sandbox resolution picked an arbitrary pool member | Resolve by the `agents.kruise.io/claim-name` **label**; never fall back to an unmatched list |
 | `failed to create /polar/session ... can't cd to <workdir>` | Internal exec inherited `spec.workdir`, which does not exist yet | Pin `cwd="/"` for bootstrap/mkdir commands |
 | Evaluator reports `failed_apply_patch`, or `eval.sh: No such file or directory` | File was written to the host session dir; no bind mount | Stage it with `publish_file()` |
 | `git config --global` exits 255 in `eval_prepare` | `$HOME` points into `/polar/session` and was never created | `mkdir -p "$HOME"` first |
 | `prepare` exits 127 on the harness CLI | `PATH` lacks the install prefix at INIT time | Export `PATH` in `prepare`, or call the absolute path |
 | `ModuleNotFoundError: swebench.harness.test_spec` | `swebench` 5.x installed | Pin `swebench>=4,<5`; **restart the gateway** afterwards — a failed import is cached in `sys.modules` for the life of the process |
 | `cannot import name 'DEFAULT_DOCKER_SPECS'` right after downgrading | Leftover 5.x package directory shadows the 4.x module | Uninstall, delete `site-packages/swebench*`, reinstall |
-| Claim stuck in `Claiming` | Pool cannot schedule: image pull, quota, taints, or provider-specific resource params | `kubectl describe sandboxclaim` / `sandbox`; check node taints and provider annotations |
 | `reward == 0` with a correct-looking patch | Instance's `eval_script` resets the whole repo | Re-pick the instance (Step 5) |
 | Binary artifacts come back mangled | Exec stream decoded as text | Read the stream with `binary=True` |
 | Agent cannot reach the model | `gateway.nodes[].public_url` unreachable from the sandbox | Test from a pod in the cluster, not from your laptop |
 | Harness CLI not found at RUN after moving off Docker/Apptainer | `kwargs.volumes` is ignored by `ack`/`e2b`; the mounted tooling directory does not exist | Bake the CLIs into the image or install them in `prepare`; on ACK use `kwargs.pod_overrides` for a real volume |
 | Session runs an **older** image than the spec says | `sandboxset_name` / `template` pinned while `image` changed; the existing pool or template is reused without an image check | Derive the name from the image, or rename the pool/template together with the image |
-| Hundreds of `SandboxSet`s left in the namespace | One pool per distinct image, and `stop()` keeps pools by design | Use Pod mode for per-instance-image datasets, or converge on one image |
 | RL steps are short / acceptance rate low, but no errors | Sessions failed to provision, so the bridge dropped those groups | Check gateway logs and pool stock; a missing image or exhausted quota looks like this |
-| Warm pool exists but steps are still slow | `sandboxset_replicas` below `max_session_concurrency`; excess claims create on demand | Size the pool from the concurrency formula, and raise the node's `max_*_workers` to match |
 
-## Appendix A: smoke-testing without a model server
+ACK-only symptoms — RBAC 403s, claims stuck in `Claiming`, claim→sandbox
+resolution, leftover pools, warm-pool sizing, image-pull failures and the
+single-context-per-process client rule — are tabulated in
+[ACK → Troubleshooting](ack/README.md#troubleshooting).
+
+## Appendix: smoke-testing without a model server
 
 To validate the runtime, proxy and evaluator without GPUs or an API key, stand in
 a stub that speaks the engine's dialect. The gateway always POSTs
@@ -618,30 +612,3 @@ tool calls execute in the sandbox, the proxy captures and canonicalizes both
 directions, and grading is real. A stub returning a known-good patch should
 produce `outcome_reward == 1.0`; anything less is a pipeline defect, not a model
 quality issue. Label results from a stub run as such.
-
-## Appendix B: one-command sanity check
-
-Before wiring a full evaluation, prove the backend in isolation:
-
-```bash
-python - <<'PY'
-import asyncio
-from pathlib import Path
-from polar.runtime.factory import create_runtime
-from polar.runtime.models import RuntimeSpec
-
-async def main():
-    spec = RuntimeSpec(backend="ack", image="<tiny-image>",
-                       kwargs={"namespace": "<namespace>", "use_sandbox_claim": True,
-                               "sandboxset_replicas": 1})
-    rt = create_runtime(spec, "sanity", Path("/tmp/sanity"))
-    await rt.start()
-    print("id       :", rt.runtime_id)
-    print("exec     :", (await rt.exec("echo hi")).stdout.strip())
-    print("timeout  :", (await rt.exec("sleep 5", timeout_sec=1)).return_code)  # -1
-    print("host path:", rt.resolve_host_path("/polar/session"))                 # None
-    await rt.stop()
-
-asyncio.run(main())
-PY
-```

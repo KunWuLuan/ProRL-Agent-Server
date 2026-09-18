@@ -1,302 +1,49 @@
-"""Kubernetes-backed rollout runtime (Alibaba Cloud ACK, or any kubeconfig cluster).
+"""``ACKRuntime`` — one Kubernetes Pod, or one claimed OpenKruise sandbox, per session.
 
-Migrated from Harbor's ``ACKEnvironment`` onto Polar's runtime contract: one Pod
-per session, shared by the init → run → eval stages.
-
-Two allocation modes:
-
-- **Pod mode** (default) — create one ``sleep infinity`` Pod from ``spec.image``.
-- **SandboxClaim mode** (``kwargs.use_sandbox_claim``) — claim a pre-warmed
-  sandbox from an OpenKruise ``SandboxSet`` pool. Session start is much faster,
-  which matters when a gateway node dispatches many rollouts at once.
-
-Images must already be built and pushed. Unlike Harbor's ``ACKEnvironment``,
-this runtime never builds from a Dockerfile: ``RuntimeSpec.image`` is a prebuilt
-reference here, exactly as it is for the Docker and Apptainer backends.
-
-Config (``RuntimeSpec``)
-------------------------
-- ``image`` — container image for the Pod / SandboxSet template.
-- ``env`` — merged into every ``exec``.
-- ``cpus`` / ``memory_mb`` / ``storage_mb`` — Pod resource *requests*
-  (memory and storage in ``Mi``; storage maps to ``ephemeral-storage``).
-- ``kwargs.namespace`` *(str, required)* — namespace for Pods and claims.
-- ``kwargs.context`` / ``kwargs.kubeconfig`` — cluster selection; falls back to
-  in-cluster config when no kubeconfig is reachable.
-- ``kwargs.image_pull_secret`` / ``kwargs.service_account`` — pull auth and SA.
-- ``kwargs.node_selector`` *(dict)* / ``kwargs.tolerations`` *(list)* — scheduling.
-- ``kwargs.pod_overrides`` *(dict)* — deep-merged into the Pod (or SandboxSet
-  template) manifest, mirroring the Kubernetes structure.
-- ``kwargs.memory_limit_multiplier`` *(float)* — set a memory *limit* of
-  ``memory_mb * multiplier`` on top of the request.
-- ``kwargs.pod_ready_timeout`` *(int, default 300)* — seconds to wait for ready.
-- ``kwargs.user`` *(str | int)* — run commands through ``su`` as this user.
-- ``kwargs.use_sandbox_claim`` *(bool, default False)* — enable pool mode.
-- ``kwargs.sandboxset_name`` *(str)* — pool name; derived from ``image`` by default.
-- ``kwargs.sandbox_image`` *(str)* — pool image; defaults to ``spec.image``.
-- ``kwargs.sandboxset_replicas`` *(int, default 5)* — warm pool size.
-- ``kwargs.claim_timeout`` *(int, default 300)* — seconds to wait for a claim.
-- ``kwargs.sandbox_labels`` / ``kwargs.sandbox_annotations`` *(dict)* — pool metadata.
-- ``kwargs.sandbox_env_vars`` *(dict)* — env vars carried on the claim. The
-  controller only injects these when the pool has envd enabled, so prefer
-  ``spec.env`` (merged into every ``exec``) for per-session variables.
-
-Requires the ``ack`` extra: ``uv pip install 'polar[ack]'``.
+Allocation modes, exec, file transfer and teardown live here; the SDK import
+guard is in :mod:`polar.runtime.ack._sdk`, manifest helpers in
+:mod:`polar.runtime.ack._util`, and client sharing in
+:mod:`polar.runtime.ack.client`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import atexit
-import hashlib
 import io
-import json
 import logging
-import re
 import shlex
-import sys
 import tarfile
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from polar.runtime.ack._sdk import (
+    _CLAIM_NAME_LABEL,
+    _POD_LABELS,
+    _SANDBOX_API_VERSION,
+    ApiException,
+    DynamicClient,
+    k8s_client,
+    retry,
+    stop_after_attempt,
+    stream,
+    wait_exponential,
+)
+from polar.runtime.ack._util import (
+    _as_bool,
+    _as_dict,
+    _as_float,
+    _deep_merge,
+    _label_dict,
+    _label_value,
+    _resource_name,
+    _string_dict,
+)
+from polar.runtime.ack.client import KubernetesClientManager
 from polar.runtime.base import BaseRuntime, session_dirs_shell_command
 from polar.runtime.models import ExecResult, RuntimeSpec
 
 logger = logging.getLogger(__name__)
-
-try:
-    from kubernetes import client as k8s_client
-    from kubernetes import config as k8s_config
-    from kubernetes.client.rest import ApiException
-    from kubernetes.dynamic import DynamicClient
-    from kubernetes.stream import stream
-    from tenacity import retry, stop_after_attempt, wait_exponential
-except ImportError as exc:
-    raise RuntimeError(
-        "the 'ack' runtime backend requires the ack extra: uv pip install 'polar[ack]'"
-    ) from exc
-
-_SANDBOX_API_VERSION = "agents.kruise.io/v1alpha1"
-_POD_LABELS = {"app": "polar-sandbox", "backend": "ack"}
-# The controller records the claim->sandbox binding on the Sandbox itself, in
-# this label. SandboxClaim.status only carries a replica count, so the label is
-# the only way to tell which pool member a claim actually took.
-_CLAIM_NAME_LABEL = "agents.kruise.io/claim-name"
-
-
-class KubernetesClientManager:
-    """Share one Kubernetes client across every ACK runtime in the process.
-
-    A gateway node drives many concurrent sessions against the same cluster, so
-    the client is created once, reference-counted, and closed at interpreter
-    exit. All runtimes in a process must use the same cluster context.
-    """
-
-    _instance: KubernetesClientManager | None = None
-    _lock = asyncio.Lock()
-
-    def __init__(self) -> None:
-        self._core_api: k8s_client.CoreV1Api | None = None
-        self._api_client: k8s_client.ApiClient | None = None
-        self._dynamic_client: DynamicClient | None = None
-        self._reference_count = 0
-        self._client_lock = asyncio.Lock()
-        self._initialized = False
-        self._cleanup_registered = False
-        self._logger = logger.getChild("KubernetesClientManager")
-        self._context: str | None = None
-        self._kubeconfig: str | None = None
-
-    @classmethod
-    async def get_instance(cls) -> KubernetesClientManager:
-        """Get or create the singleton instance."""
-        if cls._instance is None:
-            async with cls._lock:
-                if cls._instance is None:
-                    cls._instance = cls()
-        instance = cls._instance
-        if instance is None:
-            raise RuntimeError("KubernetesClientManager failed to initialize")
-        return instance
-
-    def _init_client(self, context: str | None, kubeconfig: str | None = None) -> None:
-        """Initialize the Kubernetes client from kubeconfig, else in-cluster."""
-        if self._initialized:
-            return
-        try:
-            kwargs: dict[str, Any] = {}
-            if context:
-                kwargs["context"] = context
-            if kubeconfig:
-                kwargs["config_file"] = kubeconfig
-            k8s_config.load_kube_config(**kwargs)
-        except k8s_config.ConfigException as exc:
-            try:
-                k8s_config.load_incluster_config()
-            except k8s_config.ConfigException as inner:
-                raise RuntimeError(
-                    f"failed to load kubeconfig: {inner}\n"
-                    "Ensure kubectl is configured and can access the cluster."
-                ) from exc
-        self._api_client = k8s_client.ApiClient()
-        self._core_api = k8s_client.CoreV1Api()
-        self._dynamic_client = DynamicClient(self._api_client)
-        self._initialized = True
-        self._context = context
-        self._kubeconfig = kubeconfig
-
-    async def get_client(
-        self, context: str | None = None, kubeconfig: str | None = None
-    ) -> k8s_client.CoreV1Api:
-        """Get the shared CoreV1Api client and increment the reference count."""
-        async with self._client_lock:
-            if not self._initialized:
-                self._logger.debug("creating new Kubernetes client")
-                await asyncio.to_thread(self._init_client, context, kubeconfig)
-                if not self._cleanup_registered:
-                    atexit.register(self._cleanup_sync)
-                    self._cleanup_registered = True
-            elif self._context != context:
-                raise ValueError(
-                    f"KubernetesClientManager already initialized for context "
-                    f"'{self._context}'. Cannot connect to context '{context}'. "
-                    f"Use separate processes for different clusters."
-                )
-            self._reference_count += 1
-            self._logger.debug(
-                "Kubernetes client reference count incremented to %s", self._reference_count
-            )
-            core_api = self._core_api
-        if core_api is None:
-            raise RuntimeError("Kubernetes client failed to initialize")
-        return core_api
-
-    async def get_dynamic_client(
-        self, context: str | None = None, kubeconfig: str | None = None
-    ) -> DynamicClient:
-        """Get the shared DynamicClient used for OpenKruise CRDs."""
-        await self.get_client(context, kubeconfig)
-        # Balance the internal get_client() call: the caller releases once.
-        async with self._client_lock:
-            self._reference_count -= 1
-            dynamic_client = self._dynamic_client
-        if dynamic_client is None:
-            raise RuntimeError("Kubernetes DynamicClient failed to initialize")
-        return dynamic_client
-
-    async def release_client(self) -> None:
-        """Decrement the reference count; actual cleanup happens at exit."""
-        async with self._client_lock:
-            if self._reference_count > 0:
-                self._reference_count -= 1
-                self._logger.debug(
-                    "Kubernetes client reference count decremented to %s",
-                    self._reference_count,
-                )
-
-    def _cleanup_sync(self) -> None:
-        """Synchronous cleanup wrapper for atexit."""
-        try:
-            asyncio.run(self._cleanup())
-        except Exception as exc:
-            print(f"Error during Kubernetes client cleanup: {exc}", file=sys.stderr)
-
-    async def _cleanup(self) -> None:
-        """Close the shared Kubernetes client if it exists."""
-        async with self._client_lock:
-            if not self._initialized:
-                return
-            try:
-                self._logger.debug("cleaning up Kubernetes client at program exit")
-                self._core_api = None
-                self._dynamic_client = None
-                if self._api_client is not None:
-                    self._api_client.close()
-                self._api_client = None
-                self._initialized = False
-            except Exception as exc:
-                self._logger.error("error cleaning up Kubernetes client: %s", exc)
-
-
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Deep-merge override into base dict for Kubernetes pod specs.
-
-    Dicts merge recursively. The ``containers`` and ``initContainers`` lists
-    merge element-wise by index. All other values are replaced.
-    """
-    result = dict(base)
-    for key, val in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
-            result[key] = _deep_merge(result[key], val)
-        elif (
-            key in ("containers", "initContainers")
-            and isinstance(result.get(key), list)
-            and isinstance(val, list)
-        ):
-            merged = list(result[key])
-            for i, item in enumerate(val):
-                if i < len(merged) and isinstance(merged[i], dict) and isinstance(item, dict):
-                    merged[i] = _deep_merge(merged[i], item)
-                elif i < len(merged):
-                    merged[i] = item
-                else:
-                    merged.append(item)
-            result[key] = merged
-        else:
-            result[key] = val
-    return result
-
-
-def _as_bool(value: Any) -> bool:
-    """Coerce kwargs that may arrive as strings from YAML/CLI config."""
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    """Accept a dict, a JSON string, or None."""
-    if not value:
-        return {}
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, (str, bytes, bytearray)):
-        return json.loads(value)
-    return json.loads(str(value))
-
-
-def _as_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    return float(value)
-
-
-def _resource_name(value: str, *, prefix: str = "polar", max_length: int = 63) -> str:
-    """Build a DNS-1123 name, hashed so distinct inputs never collide."""
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    digest = hashlib.sha256(value.encode()).hexdigest()[:8]
-    room = max(0, max_length - len(prefix) - len(digest) - 2)
-    parts = [part for part in (prefix, slug[:room].strip("-"), digest) if part]
-    return "-".join(parts)[:max_length].rstrip("-")
-
-
-def _label_value(value: str) -> str:
-    """Sanitize arbitrary text into a valid Kubernetes label value."""
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value)[:63].strip("._-")
-    return sanitized or "unknown"
-
-
-def _string_dict(value: Any) -> dict[str, str]:
-    """Coerce a mapping from config into ``dict[str, str]`` for K8s manifests."""
-    return {str(key): str(item) for key, item in _as_dict(value).items()}
-
-
-def _label_dict(value: Any) -> dict[str, str]:
-    """Coerce a mapping from config into valid Kubernetes label values."""
-    return {str(key): _label_value(str(item)) for key, item in _as_dict(value).items()}
 
 
 class ACKRuntime(BaseRuntime):
