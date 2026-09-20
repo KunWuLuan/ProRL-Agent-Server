@@ -103,3 +103,36 @@ uv run python examples/tmax-15k/submit_tmax_tasks.py --dataset-dir ~/tmax15k \
 The dataset dir must also be on the cluster: `submit` reads each task's
 `instruction.md`, and the `harbor` evaluator uploads its `tests/` into the
 container — only the *images* become `.sif`.
+
+## Remote sandbox backends (E2B, ACK)
+
+With a remote backend the sandbox comes from a pool instead of a local image, so
+`build_images.py` / `prepare_apptainer_images.py` are not needed — but the image
+in each task's `task.toml` (`[environment].docker_image`) must already exist in a
+registry the cluster can pull. Pass `--image-template` only when it does not
+(`{task}` / `{slug}` placeholders).
+
+```bash
+uv run python examples/tmax-15k/submit_tmax_tasks.py \
+  --dataset-dir <dataset-dir> --task <task> \
+  --harness mini_swe_agent --runtime-backend e2b \
+  --runtime-kwargs template=<pool> --workdir /app --topology <topology.yaml>
+```
+
+Two differences from the local flow:
+
+- `--dataset-dir` is the path **as the gateway sees it** — the `harbor` evaluator
+  uploads that task's `tests/` into the sandbox, so run this from the control-plane
+  host (or copy the task directory there first).
+- The `harbor` verifier inspects the container's final state, so grading must run
+  in the agent's own sandbox (`refresh_runtime: false`, which this script sets).
+
+Stock Harbor task images are often bare `ubuntu` — no `curl`, no Node. The
+uv-based harnesses (`mini_swe_agent`, `hermes`) bootstrap `curl` from apt during
+INIT; the Node CLIs need an image that already has `npm`. Pool setup and the
+required E2B environment are in the
+[remote quick start](../../src/polar/runtime/ack/QUICKSTART.md).
+
+The `ack` backend runs the same command with `--runtime-backend ack` and its own
+required kwargs — see [ACK → Running the shipped examples](../../src/polar/runtime/ack/README.md#running-the-shipped-examples).
+

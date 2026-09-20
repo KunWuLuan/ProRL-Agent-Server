@@ -14,6 +14,7 @@ per-session detail are visible in the dashboard
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -24,6 +25,7 @@ import httpx
 
 from dataset import (
     SUPPORTED_HARNESSES,
+    base_image_for_instance,
     load_swebench_verified,
     runtime_image_for_instance,
     sanitize_instance_id,
@@ -33,6 +35,10 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
 POLL_INTERVAL_SECONDS = 15.0
 
+# Remote backends launch the sandbox somewhere else, so the image has to be a
+# registry reference the cluster can pull rather than a local docker tag.
+REMOTE_BACKENDS = ("ack", "e2b")
+
 # Pinned versions keep the quickstart stable. Bump intentionally.
 HARNESS_NPM_PACKAGE: dict[str, str] = {
     "codex": "@openai/codex@0.121.0",
@@ -40,6 +46,18 @@ HARNESS_NPM_PACKAGE: dict[str, str] = {
     "claude_code": "@anthropic-ai/claude-code@2.1.111",
     "qwen_code": "@qwen-code/qwen-code@0.14.5",
 }
+
+# INIT-stage install command per harness. The Node CLIs need Node in the image;
+# the Python ones install into an isolated tool venv, so they work on bare
+# SWE-bench images and cannot disturb the testbed environment the grader uses.
+HARNESS_INSTALL: dict[str, str] = {
+    harness: f"npm install -g {package}" for harness, package in HARNESS_NPM_PACKAGE.items()
+}
+HARNESS_INSTALL["mini_swe_agent"] = (
+    "curl -LsSf https://astral.sh/uv/install.sh | sh "
+    '&& export PATH="$HOME/.local/bin:$PATH" '
+    "&& uv tool install --python 3.12 mini-swe-agent==2.4.2"
+)
 
 # INIT stage: install the harness CLI, then stage the repo into the workspace.
 _PREPARE_BASE = (
@@ -54,7 +72,7 @@ _PREPARE_BASE = (
 
 
 def prepare_command_for_harness(harness: str) -> str:
-    return f"npm install -g {HARNESS_NPM_PACKAGE[harness]} && {_PREPARE_BASE}"
+    return f"{HARNESS_INSTALL[harness]} && {_PREPARE_BASE}"
 
 
 def runtime_env_for_harness(harness: str) -> dict[str, str]:
@@ -77,7 +95,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int, default=-1, help="Maximum tasks to submit. -1 = all 500.")
     parser.add_argument("--instance-id", action="append", default=[])
     parser.add_argument("--timeout-seconds", type=float, default=3600.0)
-    parser.add_argument("--runtime-backend", choices=["docker", "apptainer"], default="docker")
+    parser.add_argument(
+        "--runtime-backend", choices=["docker", "apptainer", *REMOTE_BACKENDS], default="docker"
+    )
+    parser.add_argument(
+        "--runtime-kwargs",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra runtime.kwargs entries, repeatable; values are parsed as JSON when they "
+        "can be. Remote backends need them: e2b takes template=<sandbox pool name>, ack takes "
+        "namespace=<namespace> (plus use_sandbox_claim=true for a warm pool).",
+    )
+    parser.add_argument(
+        "--image-template",
+        default=None,
+        help="Format string for the per-instance image reference, with {instance_id}, {slug} "
+        "and {image_key} placeholders. Required for ack/e2b, which pull from a registry "
+        "instead of the local docker daemon.",
+    )
+    parser.add_argument(
+        "--refresh-runtime",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Grade in a fresh runtime (a second sandbox per session). Use --no-refresh-runtime "
+        "when the backend's data plane can only address one sandbox at a time.",
+    )
+    parser.add_argument("--topology", default=str(DEFAULT_TOPOLOGY))
     parser.add_argument(
         "--model-name",
         default="gpt-5.4",
@@ -90,6 +134,36 @@ def runtime_image_for_backend(image: str, backend: str) -> str:
     if backend == "apptainer" and not image.startswith(("docker-daemon:", "docker://", "oras://")):
         return f"docker-daemon:{image}"
     return image
+
+
+def parse_runtime_kwargs(pairs: list[str]) -> dict[str, Any]:
+    """Turn repeated ``KEY=VALUE`` flags into ``runtime.kwargs``."""
+    kwargs: dict[str, Any] = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(f"--runtime-kwargs expects KEY=VALUE, got: {pair}")
+        try:
+            kwargs[key.strip()] = json.loads(raw)
+        except json.JSONDecodeError:
+            kwargs[key.strip()] = raw
+    return kwargs
+
+
+def resolve_runtime_image(args: argparse.Namespace, instance: dict[str, Any]) -> str:
+    """The image reference Polar's runtime launches for *instance*.
+
+    ``--image-template`` wins (registry layouts differ per deployment); otherwise
+    fall back to the locally built ``polar-swebench-runtime:<slug>`` tag.
+    """
+    instance_id = str(instance["instance_id"])
+    if args.image_template:
+        return args.image_template.format(
+            instance_id=instance_id,
+            slug=sanitize_instance_id(instance_id),
+            image_key=base_image_for_instance(instance),
+        )
+    return runtime_image_for_backend(runtime_image_for_instance(instance_id), args.runtime_backend)
 
 
 def docker_image_exists(image_ref: str) -> bool:
@@ -117,7 +191,8 @@ def select_instances(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def build_task_request(args: argparse.Namespace, instance: dict[str, Any], batch_id: str) -> dict[str, Any]:
     instance_id = str(instance["instance_id"])
-    image = runtime_image_for_instance(instance_id)
+    image = resolve_runtime_image(args, instance)
+    kwargs = parse_runtime_kwargs(args.runtime_kwargs)
     return {
         "task_id": f"swebench-{args.harness}-{sanitize_instance_id(instance_id)}-{batch_id}",
         "instruction": str(instance["problem_statement"]).strip(),
@@ -130,6 +205,7 @@ def build_task_request(args: argparse.Namespace, instance: dict[str, Any], batch
             "env": runtime_env_for_harness(args.harness),
             "network": "host",
             "workdir": "/polar/session/workspace",
+            **({"kwargs": kwargs} if kwargs else {}),
         },
         "agent": {"harness": args.harness, "model_name": args.model_name},
         "builder": {"strategy": "prefix_merging"},
@@ -141,7 +217,7 @@ def build_task_request(args: argparse.Namespace, instance: dict[str, Any], batch
                 "instance": instance,
                 "exclude_patterns": evaluator_exclude_patterns_for_harness(args.harness),
             },
-            "refresh_runtime": True,
+            "refresh_runtime": args.refresh_runtime,
         },
     }
 
@@ -157,7 +233,7 @@ def task_stats(result: dict[str, Any]) -> tuple[int, int]:
     return reward_one, len(sessions)
 
 
-def print_summary(stats: dict[str, tuple[int, int]], elapsed: float) -> None:
+def print_summary(stats: dict[str, tuple[int, int]], elapsed: float, topology: str) -> None:
     total_tasks = len(stats)
     resolved = sum(1 for r1, _ in stats.values() if r1 > 0)
     total_sessions = sum(total for _, total in stats.values())
@@ -175,7 +251,7 @@ def print_summary(stats: dict[str, tuple[int, int]], elapsed: float) -> None:
     for iid in sorted(stats):
         r1, total = stats[iid]
         print(f"  {iid:<45} {f'{r1}/{total}':>12}")
-    print("\n  Per-session detail: polar dashboard -c examples/swebench_verified/topology.vllm.yaml")
+    print(f"\n  Per-session detail: polar dashboard -c {topology}")
 
 
 def main() -> int:
@@ -185,19 +261,27 @@ def main() -> int:
     if not instances:
         raise SystemExit("No instances selected.")
 
-    ready, missing = [], []
-    for instance in instances:
-        image_ref = runtime_image_for_instance(str(instance["instance_id"]))
-        (ready if docker_image_exists(image_ref) else missing).append(instance)
-    if not ready:
-        raise SystemExit("No runtime images found. Run: python build_images.py")
-    if missing:
-        print(f"Skipping {len(missing)} instance(s) with missing images. Build them with: python build_images.py")
-    instances = ready
+    if args.runtime_backend in REMOTE_BACKENDS:
+        # The cluster pulls the image itself; there is no local daemon to check.
+        if not args.image_template:
+            raise SystemExit(
+                f"--runtime-backend {args.runtime_backend} needs --image-template: the sandbox "
+                "pulls from a registry, so a local docker tag is not addressable."
+            )
+    else:
+        ready, missing = [], []
+        for instance in instances:
+            image_ref = runtime_image_for_instance(str(instance["instance_id"]))
+            (ready if docker_image_exists(image_ref) else missing).append(instance)
+        if not ready:
+            raise SystemExit("No runtime images found. Run: python build_images.py")
+        if missing:
+            print(f"Skipping {len(missing)} instance(s) with missing images. Build them with: python build_images.py")
+        instances = ready
 
     from polar.config import TopologyConfig
 
-    rollout_url = TopologyConfig.load(DEFAULT_TOPOLOGY).rollout.public_url
+    rollout_url = TopologyConfig.load(args.topology).rollout.public_url
     print(f"Submitting {len(instances)} task(s) to {rollout_url} "
           f"(harness={args.harness}, samples={args.num_samples}, backend={args.runtime_backend})")
 
@@ -227,7 +311,7 @@ def main() -> int:
                           f"({len(stats)}/{len(task_ids)} done)")
         elapsed = time.monotonic() - t0
 
-    print_summary(stats, elapsed)
+    print_summary(stats, elapsed, args.topology)
     return 0
 
 

@@ -19,6 +19,11 @@ The schema is **strict and immutable**: unknown keys are rejected
 Convenience defaulting fills the gaps — a blank `public_url` is derived from
 `host:port` (mapping `0.0.0.0`/`::` → `127.0.0.1`), and `gateway.rollout_server_url`
 falls back to `rollout.public_url` when omitted.
+Those derived loopback URLs are **single-host test defaults**: right for a
+laptop run where every process shares one network namespace, wrong for any
+deployment where a caller lives somewhere else — notably a remote sandbox, which
+dials the gateway's `public_url` from inside another pod
+([network addressing](../runtime/ack/RUNBOOK.md#network-addressing-who-must-reach-whom)).
 
 ## Main files
 
@@ -91,12 +96,24 @@ gateway:
         base_url: http://127.0.0.1:8000
 ```
 
+The example is a single-host development topology: every URL is loopback because
+every process shares the host. A cluster deployment advertises resolvable
+addresses instead — see
+[Step 4](../runtime/ack/RUNBOOK.md#step-4--deploy-the-control-plane-where-sandboxes-can-reach-it).
+
 ## Reachable URLs and multi-node
 
 `public_url`s must be reachable by whoever calls them: the rollout server calls
 each node's `public_url`; each node calls back to `rollout_server_url` and its
-own `inference.base_url`. Locally the derived `127.0.0.1` URLs work; for
-multi-host deployments set explicit reachable URLs.
+own `inference.base_url`. A remote sandbox runtime adds a fourth caller: the
+agent inside the sandbox, which receives the node's `public_url` as its
+`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `GOOGLE_API_URL`.
+
+Locally the derived `127.0.0.1` URLs work, because every caller shares the host.
+Treat them as **test-only** anywhere else: for multi-host deployments — and for
+every run whose sandbox is a remote pod — set explicit addresses each caller can
+resolve. `inference.base_url` is the exception, since loopback stays correct when
+the inference engine runs beside the gateway.
 
 `polar serve_gateway` requires `--node-id` when the topology has more than one
 node, so a gateway process always starts with the right ports, worker limits,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -17,6 +18,29 @@ RUNTIME_LOGS_DIR: Final[str] = f"{RUNTIME_SESSION_DIR}/logs"
 RUNTIME_AGENT_LOG_DIR: Final[str] = f"{RUNTIME_LOGS_DIR}/agent"
 RUNTIME_EVAL_LOG_DIR: Final[str] = f"{RUNTIME_LOGS_DIR}/eval"
 RUNTIME_EVAL_ARTIFACT_DIR: Final[str] = f"{RUNTIME_SESSION_DIR}/eval_artifacts"
+
+
+def session_dirs_shell_command(*, chmod: bool = False) -> str:
+    """Shell command creating Polar's well-known in-runtime directories.
+
+    Backends without a host bind mount run this on start so harnesses and
+    evaluators find the paths they expect. ``chmod`` makes the tree
+    world-writable, which remote file-transfer APIs need when they run as a
+    different user than ``exec``.
+    """
+    targets = " ".join(
+        shlex.quote(path)
+        for path in (
+            RUNTIME_ARTIFACTS_DIR,
+            RUNTIME_AGENT_LOG_DIR,
+            RUNTIME_EVAL_LOG_DIR,
+            RUNTIME_EVAL_ARTIFACT_DIR,
+        )
+    )
+    command = f"mkdir -p {targets}"
+    if chmod:
+        command += f" && chmod 777 {shlex.quote(RUNTIME_SESSION_DIR)} {targets}"
+    return command
 
 
 class BaseRuntime(ABC):
@@ -114,6 +138,23 @@ class BaseRuntime(ABC):
         except ValueError:
             return None
         return self.session_dir / relative
+
+    async def publish_file(self, local_path: str | Path, runtime_path: str) -> None:
+        """Make a host-written file visible inside the runtime at *runtime_path*.
+
+        Backends that bind-mount ``session_dir`` already expose the file when the
+        caller wrote it to the mapped host path, so this is a no-op there.
+        Remote backends (E2B, ACK) have no bind mount and need an explicit
+        upload, otherwise the runtime silently sees nothing.
+        """
+        source = Path(local_path)
+        mapped = self.resolve_host_path(runtime_path)
+        if mapped is not None:
+            if source.resolve() == mapped.resolve():
+                return
+            self._copy_to_bind_mount(str(source), runtime_path)
+            return
+        await self.upload_file(str(source), runtime_path)
 
     def _copy_from_bind_mount(self, runtime_path: str, local_path: Path) -> bool:
         host_path = self.resolve_host_path(runtime_path)

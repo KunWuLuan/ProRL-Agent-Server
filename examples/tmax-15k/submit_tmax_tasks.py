@@ -13,6 +13,7 @@ reproducing TMax's reward (1.0 = ``test_final_state.py`` passed, else 0.0).
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -34,6 +35,15 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 DEFAULT_TOPOLOGY = EXAMPLE_DIR / "topology.vllm.yaml"
 POLL_INTERVAL_SECONDS = 15.0
 
+# The uv installer is fetched with curl, which stock task images (an unmodified
+# ``ubuntu:24.04`` env image, say) do not always ship. Bootstrap it first so the
+# remote backends can run registry images as-is, without the Node/curl layer that
+# ``build_images.py`` adds for local runs.
+UV_CURL_BOOTSTRAP = (
+    "command -v curl >/dev/null 2>&1 || "
+    "(apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates)"
+)
+
 # Per-harness INIT install command. The Node CLIs install globally. hermes and
 # mini-swe-agent are PyPI packages that need Python >=3.11, but TMax task images
 # ship whatever Python they were built with (this set includes 3.10), so installing
@@ -49,16 +59,21 @@ HARNESS_INSTALL: dict[str, str] = {
     "qwen_code": "npm install -g @qwen-code/qwen-code@0.14.5",
     "pi": "npm install -g @mariozechner/pi-coding-agent@0.67.68",
     "hermes": (
-        "curl -LsSf https://astral.sh/uv/install.sh | sh "
+        f"{UV_CURL_BOOTSTRAP} && curl -LsSf https://astral.sh/uv/install.sh | sh "
         '&& export PATH="$HOME/.local/bin:$PATH" '
         "&& uv tool install --python 3.12 hermes-agent==0.15.1"
     ),
     "mini_swe_agent": (
-        "curl -LsSf https://astral.sh/uv/install.sh | sh "
+        f"{UV_CURL_BOOTSTRAP} && curl -LsSf https://astral.sh/uv/install.sh | sh "
         '&& export PATH="$HOME/.local/bin:$PATH" '
         "&& uv tool install --python 3.12 mini-swe-agent==2.4.2"
     ),
 }
+
+
+# Remote backends launch the sandbox somewhere else, so the image has to be a
+# registry reference the cluster can pull rather than a local docker tag.
+REMOTE_BACKENDS = ("ack", "e2b")
 
 
 def model_name_for(harness: str, model_name: str) -> str:
@@ -93,7 +108,24 @@ def parse_args() -> argparse.Namespace:
         default="gpt-5.4",
         help="Model name the harness sends; the gateway rewrites it to the served model.",
     )
-    parser.add_argument("--runtime-backend", choices=["docker", "apptainer"], default="docker")
+    parser.add_argument(
+        "--runtime-backend", choices=["docker", "apptainer", *REMOTE_BACKENDS], default="docker"
+    )
+    parser.add_argument(
+        "--runtime-kwargs",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra runtime.kwargs entries, repeatable; values are parsed as JSON when they "
+        "can be. Remote backends need them: e2b takes template=<sandbox pool name>, ack takes "
+        "namespace=<namespace> (plus use_sandbox_claim=true for a warm pool).",
+    )
+    parser.add_argument(
+        "--image-template",
+        default=None,
+        help="Format string for the per-task image reference, with {task} and {slug} "
+        "placeholders. Only needed for ack/e2b when task.toml has no environment.docker_image.",
+    )
     parser.add_argument(
         "--apptainer-image-dir",
         default=None,
@@ -105,12 +137,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_runtime_kwargs(pairs: list[str]) -> dict[str, Any]:
+    """Turn repeated ``KEY=VALUE`` flags into ``runtime.kwargs``."""
+    kwargs: dict[str, Any] = {}
+    for pair in pairs:
+        key, sep, raw = pair.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(f"--runtime-kwargs expects KEY=VALUE, got: {pair}")
+        try:
+            kwargs[key.strip()] = json.loads(raw)
+        except json.JSONDecodeError:
+            kwargs[key.strip()] = raw
+    return kwargs
+
+
 def resolve_runtime_image(args: argparse.Namespace, task: TmaxTask) -> str:
     """The image reference Polar's runtime launches for *task*.
 
     ``.sif`` path (docker-free apptainer) > ``docker-daemon:`` (apptainer reading
-    the local docker daemon) > the plain docker tag.
+    the local docker daemon) > the plain docker tag. Remote backends cannot see a
+    local daemon at all: they use ``--image-template``, else the registry
+    reference the task's own ``task.toml`` already carries
+    (``environment.docker_image``).
     """
+    if args.runtime_backend in REMOTE_BACKENDS:
+        if args.image_template:
+            return args.image_template.format(task=task.name, slug=sanitize(task.name))
+        if task.docker_image:
+            return task.docker_image
+        raise SystemExit(
+            f"task {task.name} has no environment.docker_image in task.toml; pass "
+            "--image-template so the cluster knows which registry image to pull"
+        )
     if args.runtime_backend == "apptainer" and args.apptainer_image_dir:
         return str(Path(args.apptainer_image_dir).expanduser() / sif_filename_for(task.name))
     image = runtime_image_for(task.name)
@@ -122,6 +180,8 @@ def resolve_runtime_image(args: argparse.Namespace, task: TmaxTask) -> str:
 def image_available(args: argparse.Namespace, task: TmaxTask) -> bool:
     """Whether the launchable image exists — a ``.sif`` for docker-free apptainer,
     otherwise a local docker image (so this works on nodes without docker)."""
+    if args.runtime_backend in REMOTE_BACKENDS:
+        return True  # the cluster pulls it; there is no local daemon to check
     if args.runtime_backend == "apptainer" and args.apptainer_image_dir:
         return (Path(args.apptainer_image_dir).expanduser() / sif_filename_for(task.name)).is_file()
     return docker_image_exists(runtime_image_for(task.name))
@@ -156,6 +216,7 @@ def build_task_request(args: argparse.Namespace, task: TmaxTask, batch_id: str) 
             "env": {"HOME": args.workdir} if args.workdir == "/root" else {},
             "network": "host",
             "workdir": task.workdir or args.workdir,
+            **({"kwargs": kwargs} if (kwargs := parse_runtime_kwargs(args.runtime_kwargs)) else {}),
         },
         "agent": {"harness": args.harness, "model_name": model_name_for(args.harness, args.model_name)},
         "builder": {"strategy": "prefix_merging"},

@@ -30,6 +30,14 @@ swebench = [
     "swebench",
     "datasets",
 ]
+e2b = [
+    "e2b>=2.25.0,<2.51",
+    "tenacity>=9.1.2",
+]
+ack = [
+    "kubernetes>=32.0.0",
+    "tenacity>=9.1.2",
+]
 
 [project.scripts]
 polar = "polar.cli:main"

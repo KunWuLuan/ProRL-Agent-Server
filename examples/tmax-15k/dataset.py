@@ -52,6 +52,7 @@ class TmaxTask:
     memory_mb: int | None
     allow_internet: bool
     workdir: str | None
+    docker_image: str | None = None
 
 
 def sanitize(name: str) -> str:
@@ -112,6 +113,7 @@ def _load_task(task_dir: Path) -> TmaxTask | None:
         memory_mb=(_coerce(env.get("memory_mb"), int, None) if env.get("memory_mb") is not None else None),
         allow_internet=bool(env.get("allow_internet", True)),
         workdir=str(env["workdir"]) if env.get("workdir") else None,
+        docker_image=str(env["docker_image"]) if env.get("docker_image") else None,
     )
 
 
